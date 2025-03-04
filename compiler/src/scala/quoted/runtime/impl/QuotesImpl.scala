@@ -1413,7 +1413,7 @@ class QuotesImpl private (using val ctx: Context) extends Quotes, QuoteUnpickler
 
     object TypeBlockTypeTest extends TypeTest[Tree, TypeBlock]:
       def unapply(x: Tree): Option[TypeBlock & x.type] = x match
-        case tpt: (tpd.Block & x.type) => Some(tpt)
+        case tpt: (tpd.Block & x.type) if x.isType => Some(tpt)
         case _ => None
     end TypeBlockTypeTest
 
@@ -1694,7 +1694,7 @@ class QuotesImpl private (using val ctx: Context) extends Quotes, QuoteUnpickler
     end SimpleSelectorTypeTest
 
     object SimpleSelector extends SimpleSelectorModule:
-      def apply(name: String): SimpleSelector = 
+      def apply(name: String): SimpleSelector =
         withDefaultPos(untpd.ImportSelector(untpd.Ident(name.toTermName)))
       def unapply(x: SimpleSelector): Some[String] = Some(x.name.toString)
     end SimpleSelector
@@ -1837,7 +1837,15 @@ class QuotesImpl private (using val ctx: Context) extends Quotes, QuoteUnpickler
         def termSymbol: Symbol = self.termSymbol
         def isSingleton: Boolean = self.isSingleton
         def memberType(member: Symbol): TypeRepr =
-          member.info.asSeenFrom(self, member.owner)
+          // we replace thisTypes here to avoid resolving otherwise unstable prefixes into Nothing
+          val memberInfo =
+            if self.typeSymbol.isClassDef then
+              member.info.substThis(self.classSymbol.asClass, self)
+            else
+              member.info
+          memberInfo
+            .asSeenFrom(self, member.owner)
+
         def baseClasses: List[Symbol] = self.baseClasses
         def baseType(cls: Symbol): TypeRepr = self.baseType(cls)
         def derivesFrom(cls: Symbol): Boolean = self.derivesFrom(cls)
