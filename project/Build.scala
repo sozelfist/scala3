@@ -10,6 +10,7 @@ import complete.DefaultParsers._
 import pl.project13.scala.sbt.JmhPlugin
 import pl.project13.scala.sbt.JmhPlugin.JmhKeys.Jmh
 import com.gradle.develocity.agent.sbt.DevelocityPlugin.autoImport._
+import com.gradle.develocity.agent.sbt.api.experimental.buildcache
 import com.typesafe.sbt.packager.Keys._
 import com.typesafe.sbt.packager.MappingsHelper.directory
 import com.typesafe.sbt.packager.universal.UniversalPlugin
@@ -98,7 +99,7 @@ object Build {
    *
    *  Warning: Change of this variable needs to be consulted with `expectedTastyVersion`
    */
-  val referenceVersion = "3.6.4-RC1"
+  val referenceVersion = "3.6.4"
 
   /** Version of the Scala compiler targeted in the current release cycle
    *  Contains a version without RC/SNAPSHOT/NIGHTLY specific suffixes
@@ -184,7 +185,7 @@ object Build {
   val mimaPreviousLTSDottyVersion = "3.3.0"
 
   /** Version of Scala CLI to download */
-  val scalaCliLauncherVersion = "1.6.1"
+  val scalaCliLauncherVersion = "1.7.0"
   /** Version of Coursier to download for initializing the local maven repo of Scala command */
   val coursierJarVersion = "2.1.24"
 
@@ -339,24 +340,27 @@ object Build {
           buildScan
             .withPublishing(Publishing.onlyIf(_.authenticated))
             .withBackgroundUpload(!isInsideCI)
-            .tag(if (isInsideCI) "CI" else "Local")
+            .withTag(if (isInsideCI) "CI" else "Local")
             .withLinks(buildScan.links ++ GithubEnv.develocityLinks)
             .withValues(buildScan.values ++ GithubEnv.develocityValues)
             .withObfuscation(buildScan.obfuscation.withIpAddresses(_.map(_ => "0.0.0.0")))
         )
         .withBuildCache(
           buildCache
-            .withLocal(buildCache.local.withEnabled(false))
-            .withRemote(buildCache.remote.withEnabled(false))
+            .withLocal(buildCache.local.withEnabled(true).withStoreEnabled(true))
+            .withRemote(buildCache.remote.withEnabled(true).withStoreEnabled(isInsideCI))
         )
-        .withTestRetryConfiguration(
-          config.testRetryConfiguration
+        .withTestRetry(
+          config.testRetry
             .withFlakyTestPolicy(FlakyTestPolicy.Fail)
             .withMaxRetries(if (isInsideCI) 1 else 0)
             .withMaxFailures(10)
             .withClassesFilter((className, _) => !noRetryTestClasses.contains(className))
         )
-    }
+    },
+    // Deactivate Develocity's test caching because it caches all tests or nothing.
+    // Also at the moment, it does not take compilation files as inputs.
+    Test / develocityBuildCacheClient := None,
   )
 
   // Settings shared globally (scoped in Global). Used in build.sbt
@@ -604,7 +608,10 @@ object Build {
       assert(docScalaInstance.loaderCompilerOnly == base.loaderCompilerOnly)
       docScalaInstance
     },
-    Compile / doc / scalacOptions ++= scalacOptionsDocSettings()
+    Compile / doc / scalacOptions ++= scalacOptionsDocSettings(),
+    // force recompilation of bootstrapped modules when the compiler changes
+    Compile / compile / buildcache.develocityTaskCacheKeyComponents +=
+      (`scala3-compiler` / Compile / compile / buildcache.develocityTaskCacheKey).taskValue
   )
 
   lazy val commonBenchmarkSettings = Seq(
@@ -773,9 +780,9 @@ object Build {
       libraryDependencies ++= Seq(
         "org.scala-lang.modules" % "scala-asm" % "9.7.1-scala-1", // used by the backend
         Dependencies.compilerInterface,
-        "org.jline" % "jline-reader" % "3.27.1",   // used by the REPL
-        "org.jline" % "jline-terminal" % "3.27.1",
-        "org.jline" % "jline-terminal-jni" % "3.27.1", // needed for Windows
+        "org.jline" % "jline-reader" % "3.29.0",   // used by the REPL
+        "org.jline" % "jline-terminal" % "3.29.0",
+        "org.jline" % "jline-terminal-jni" % "3.29.0", // needed for Windows
         ("io.get-coursier" %% "coursier" % "2.0.16" % Test).cross(CrossVersion.for3Use2_13),
       ),
 
@@ -1015,10 +1022,6 @@ object Build {
           sjsSources
         } (Set(scalaJSIRSourcesJar)).toSeq
       }.taskValue,
-
-      // Develocity's Build Cache does not work with our compilation tests
-      // at the moment: it does not take compilation files as inputs.
-      Test / develocityBuildCacheClient := None,
   )
 
   def insertClasspathInArgs(args: List[String], cp: String): List[String] = {
@@ -1117,7 +1120,7 @@ object Build {
     libraryDependencies += "org.scala-lang" % "scala-library" % stdlibVersion,
     (Compile / scalacOptions) ++= Seq(
       // Needed so that the library sources are visible when `dotty.tools.dotc.core.Definitions#init` is called
-      "-sourcepath", (Compile / sourceDirectories).value.map(_.getAbsolutePath).distinct.mkString(File.pathSeparator),
+      "-sourcepath", (Compile / sourceDirectories).value.map(_.getCanonicalPath).distinct.mkString(File.pathSeparator),
       "-Yexplicit-nulls",
     ),
     (Compile / doc / scalacOptions) ++= ScaladocConfigs.DefaultGenerationSettings.value.settings,
