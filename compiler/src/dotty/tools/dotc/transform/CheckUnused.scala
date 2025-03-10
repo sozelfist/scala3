@@ -58,6 +58,12 @@ class CheckUnused private (phaseMode: PhaseMode, suffix: String) extends MiniPha
         || tree.srcPos.isZeroExtentSynthetic
         || refInfos.inlined.exists(_.sourcePos.contains(tree.srcPos.sourcePos))
       if resolving && !ignoreTree(tree) then
+        def loopOverPrefixes(prefix: Type, depth: Int): Unit =
+          if depth < 10 && prefix.exists && !prefix.classSymbol.isEffectiveRoot then
+            resolveUsage(prefix.classSymbol, nme.NO_NAME, NoPrefix)
+            loopOverPrefixes(prefix.normalizedPrefix, depth + 1)
+        if tree.srcPos.isZeroExtentSynthetic then
+          loopOverPrefixes(tree.typeOpt.normalizedPrefix, depth = 0)
         resolveUsage(tree.symbol, tree.name, tree.typeOpt.importPrefix.skipPackageObject)
     else if tree.hasType then
       resolveUsage(tree.tpe.classSymbol, tree.name, tree.tpe.importPrefix.skipPackageObject)
@@ -66,6 +72,10 @@ class CheckUnused private (phaseMode: PhaseMode, suffix: String) extends MiniPha
   // import x.y; y may be rewritten x.y, also import x.z as y
   override def transformSelect(tree: Select)(using Context): tree.type =
     val name = tree.removeAttachment(OriginalName).getOrElse(nme.NO_NAME)
+    inline def isImportable = tree.qualifier.srcPos.isSynthetic
+      && tree.qualifier.tpe.match
+        case ThisType(_) | SuperType(_, _) => false
+        case qualtpe => qualtpe.isStable
     if tree.srcPos.isSynthetic && tree.symbol == defn.TypeTest_unapply then
       tree.qualifier.tpe.underlying.finalResultType match
       case AppliedType(tycon, args) =>
@@ -76,10 +86,10 @@ class CheckUnused private (phaseMode: PhaseMode, suffix: String) extends MiniPha
         val target = res.dealias.typeSymbol
         resolveUsage(target, target.name, res.importPrefix.skipPackageObject) // case _: T =>
       case _ =>
-    else if tree.qualifier.srcPos.isSynthetic && tree.qualifier.tpe.isStable || name.exists(_ != tree.symbol.name) then
+    else if isImportable || name.exists(_ != tree.symbol.name) then
       if !ignoreTree(tree) then
         resolveUsage(tree.symbol, name, tree.qualifier.tpe)
-    else
+    else if !ignoreTree(tree) then
       refUsage(tree.symbol)
     tree
 
@@ -112,7 +122,7 @@ class CheckUnused private (phaseMode: PhaseMode, suffix: String) extends MiniPha
     tree
 
   override def prepareForMatch(tree: Match)(using Context): Context =
-    // exonerate case.pat against tree.selector (simple var pat only for now)
+    // allow case.pat against tree.selector (simple var pat only for now)
     tree.selector match
     case Ident(nm) => tree.cases.foreach(k => allowVariableBindings(List(nm), List(k.pat)))
     case _ =>
@@ -134,9 +144,9 @@ class CheckUnused private (phaseMode: PhaseMode, suffix: String) extends MiniPha
     refInfos.inlined.push(tree.call.srcPos)
     ctx
   override def transformInlined(tree: Inlined)(using Context): tree.type =
+    transformAllDeep(tree.expansion) // traverse expansion with nonempty inlined stack to avoid registering defs
     val _ = refInfos.inlined.pop()
-    if !tree.call.isEmpty && phaseMode.eq(PhaseMode.Aggregate) then
-      transformAllDeep(tree.call)
+    transformAllDeep(tree.call)
     tree
 
   override def prepareForBind(tree: Bind)(using Context): Context =
@@ -146,16 +156,15 @@ class CheckUnused private (phaseMode: PhaseMode, suffix: String) extends MiniPha
   override def prepareForValDef(tree: ValDef)(using Context): Context =
     if !tree.symbol.is(Deferred) && tree.rhs.symbol != defn.Predef_undefined then
       refInfos.register(tree)
+    tree.tpt match
+    case RefinedTypeTree(_, refinements) => relax(tree.rhs, refinements)
+    case _ =>
     ctx
   override def transformValDef(tree: ValDef)(using Context): tree.type =
     traverseAnnotations(tree.symbol)
     if tree.name.startsWith("derived$") && tree.hasType then
       def loop(t: Tree): Unit = t match
-        case Ident(name)  =>
-          val target =
-            val ts0 = t.tpe.typeSymbol
-            if ts0.is(ModuleClass) then ts0.companionModule else ts0
-          resolveUsage(target, name, t.tpe.underlyingPrefix.skipPackageObject)
+        case Ident(name)  => resolveUsage(t.tpe.typeSymbol, name, t.tpe.underlyingPrefix.skipPackageObject)
         case Select(t, _) => loop(t)
         case _            =>
       tree.getAttachment(OriginalTypeClass).foreach(loop)
@@ -166,11 +175,15 @@ class CheckUnused private (phaseMode: PhaseMode, suffix: String) extends MiniPha
   override def prepareForDefDef(tree: DefDef)(using Context): Context =
     def trivial = tree.symbol.is(Deferred) || isUnconsuming(tree.rhs)
     def nontrivial = tree.symbol.isConstructor || tree.symbol.isAnonymousFunction
-    if !nontrivial && trivial then refInfos.skip.addOne(tree.symbol)
+    if !nontrivial && trivial then
+      refInfos.skip.addOne(tree.symbol)
     if tree.symbol.is(Inline) then
       refInfos.inliners += 1
     else if !tree.symbol.is(Deferred) && tree.rhs.symbol != defn.Predef_undefined then
       refInfos.register(tree)
+    tree.tpt match
+    case RefinedTypeTree(_, refinements) => relax(tree.rhs, refinements)
+    case _ =>
     ctx
   override def transformDefDef(tree: DefDef)(using Context): tree.type =
     traverseAnnotations(tree.symbol)
@@ -270,8 +283,9 @@ class CheckUnused private (phaseMode: PhaseMode, suffix: String) extends MiniPha
    *  For Select, lint does not look up `<empty>.scala` (so top-level syms look like magic) but records `scala.Int`.
    *  For Ident, look-up finds the root import as usual. A competing import is OK because higher precedence.
    */
-  def resolveUsage(sym: Symbol, name: Name, prefix: Type)(using Context): Unit =
+  def resolveUsage(sym0: Symbol, name: Name, prefix: Type)(using Context): Unit =
     import PrecedenceLevels.*
+    val sym = sym0.userSymbol
 
     def matchingSelector(info: ImportInfo): ImportSelector | Null =
       val qtpe = info.site
@@ -280,8 +294,11 @@ class CheckUnused private (phaseMode: PhaseMode, suffix: String) extends MiniPha
         case sel :: sels =>
           val matches =
             if sel.isWildcard then
+              // if name is different from sym.name, it must be a rename on import, not a wildcard selector
+              !name.exists(_.toTermName != sym.name.toTermName)
               // the qualifier must have the target symbol as a member
-              hasAltMember(sym.name) && {
+              && hasAltMember(sym.name)
+              && {
                 if sel.isGiven then // Further check that the symbol is a given or implicit and conforms to the bound
                      sym.isOneOf(GivenOrImplicit)
                   && (sel.bound.isEmpty || sym.info.finalResultType <:< sel.boundTpe)
@@ -313,7 +330,8 @@ class CheckUnused private (phaseMode: PhaseMode, suffix: String) extends MiniPha
         case none =>
 
     // Avoid spurious NoSymbol and also primary ctors which are never warned about.
-    if !sym.exists || sym.isPrimaryConstructor then return
+    // Selections C.this.toString should be already excluded, but backtopped here for eq, etc.
+    if !sym.exists || sym.isPrimaryConstructor || sym.isEffectiveRoot || defn.topClasses(sym.owner) then return
 
     // Find the innermost, highest precedence. Contexts have no nesting levels but assume correctness.
     // If the sym is an enclosing definition (the owner of a context), it does not count toward usages.
@@ -448,12 +466,15 @@ object CheckUnused:
         if !tree.name.isInstanceOf[DerivedName] then
           pats.addOne((tree.symbol, tree.namePos))
       case tree: NamedDefTree =>
-        if (tree.symbol ne NoSymbol) && !tree.name.isWildcard then
-          defs.addOne((tree.symbol, tree.namePos))
+        if (tree.symbol ne NoSymbol)
+          && !tree.name.isWildcard
+          && !tree.hasAttachment(NoWarn)
+          && !tree.symbol.is(ModuleVal) // track only the ModuleClass using the object symbol, with correct namePos
+        then
+          defs.addOne((tree.symbol.userSymbol, tree.namePos))
       case _ =>
-        //println(s"OTHER ${tree.symbol}")
         if tree.symbol ne NoSymbol then
-          defs.addOne((tree.symbol, tree.srcPos))
+          defs.addOne((tree.symbol, tree.srcPos)) // TODO is this a code path
 
     val inlined = Stack.empty[SrcPos] // enclosing call.srcPos of inlined code (expansions)
     var inliners = 0 // depth of inline def (not inlined yet)
@@ -513,7 +534,7 @@ object CheckUnused:
     def checkPrivate(sym: Symbol, pos: SrcPos) =
       if ctx.settings.WunusedHas.privates
         && !sym.isPrimaryConstructor
-        && sym.is(Private, butNot = SelfName | Synthetic | CaseAccessor)
+        && !sym.isOneOf(SelfName | Synthetic | CaseAccessor)
         && !sym.name.is(BodyRetainerName)
         && !sym.isSerializationSupport
         && !(sym.is(Mutable) && sym.isSetter && sym.owner.is(Trait)) // tracks sym.underlyingSymbol sibling getter
@@ -588,7 +609,10 @@ object CheckUnused:
           val alias = m.owner.info.member(sym.name)
           if alias.exists then
             val aliasSym = alias.symbol
-            if aliasSym.is(ParamAccessor) && !infos.refs(alias.symbol) then
+            val checking =
+                 aliasSym.isAllOf(PrivateParamAccessor, butNot = CaseAccessor)
+              || aliasSym.isAllOf(Protected | ParamAccessor, butNot = CaseAccessor) && m.owner.is(Given)
+            if checking && !infos.refs(alias.symbol) then
               warnAt(pos)(UnusedSymbol.implicitParams)
         else
           warnAt(pos)(UnusedSymbol.implicitParams)
@@ -754,7 +778,7 @@ object CheckUnused:
     for (sym, pos) <- infos.defs.iterator if !sym.hasAnnotation(defn.UnusedAnnot) do
       if infos.refs(sym) then
         checkUnassigned(sym, pos)
-      else if sym.is(Private, butNot = ParamAccessor) then
+      else if sym.isEffectivelyPrivate then
         checkPrivate(sym, pos)
       else if sym.is(Param, butNot = Given | Implicit) then
         checkParam(sym, pos)
@@ -841,6 +865,17 @@ object CheckUnused:
         args.foreach(traverse)
       case tree => traverseChildren(tree)
 
+  // NoWarn members in tree that correspond to refinements; currently uses only names.
+  def relax(tree: Tree, refinements: List[Tree])(using Context): Unit =
+    val names = refinements.collect { case named: NamedDefTree => named.name }.toSet
+    val relaxer = new TreeTraverser:
+      def traverse(tree: Tree)(using Context) =
+        tree match
+        case tree: NamedDefTree if names(tree.name) => tree.withAttachment(NoWarn, ())
+        case _ =>
+        traverseChildren(tree)
+    relaxer.traverse(tree)
+
   extension (nm: Name)
     inline def exists(p: Name => Boolean): Boolean = nm.ne(nme.NO_NAME) && p(nm)
     inline def isWildcard: Boolean = nm == nme.WILDCARD || nm.is(WildcardParamName)
@@ -875,6 +910,12 @@ object CheckUnused:
       sym.isClass && sym.info.allMembers.forall: d =>
         val m = d.symbol
         !m.isTerm || m.isSelfSym || m.is(Method) && (m.owner == defn.AnyClass || m.owner == defn.ObjectClass)
+    def isEffectivelyPrivate(using Context): Boolean =
+      sym.is(Private, butNot = ParamAccessor)
+      || sym.owner.isAnonymousClass && !sym.nextOverriddenSymbol.exists
+    // pick the symbol the user wrote for purposes of tracking
+    inline def userSymbol(using Context): Symbol=
+      if sym.denot.is(ModuleClass) then sym.denot.companionModule else sym
 
   extension (sel: ImportSelector)
     def boundTpe: Type = sel.bound match
