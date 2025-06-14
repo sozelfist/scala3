@@ -22,11 +22,18 @@ private val Captures: Key[CaptureSet] = Key()
 def isCaptureChecking(using Context): Boolean =
   ctx.phaseId == Phases.checkCapturesPhase.id
 
-/** Are we at checkCaptures or Setup phase? */
+/** Are we in the CheckCaptures or Setup phase? */
 def isCaptureCheckingOrSetup(using Context): Boolean =
-  val ccId = Phases.checkCapturesPhase.id
-  val ctxId = ctx.phaseId
-  ctxId == ccId || ctxId == ccId - 1
+  val ccPhase = Phases.checkCapturesPhase
+  ccPhase.exists
+  && {
+    val ccId = ccPhase.id
+    val ctxId = ctx.phaseId
+    ctxId == ccId
+    || ctxId == ccId - 1 && ccState.iterationId > 0
+      // Note: just checking phase id is not enough since Setup would
+      // also be the phase after pattern matcher.
+  }
 
 /** A dependent function type with given arguments and result type
  *  TODO Move somewhere else where we treat all function type related ops together.
@@ -47,28 +54,6 @@ def ccState(using Context): CCState =
 
 extension (tree: Tree)
 
-  /** Map tree with a Capability type to the corresponding capability,
-   *  map CapSet^{refs} to the `refs` references,
-   *  throw IllegalCaptureRef otherwise
-   */
-  def toCapabilities(using Context): List[Capability] = tree match
-    case ReachCapabilityApply(arg) =>
-      arg.toCapabilities.map(_.reach)
-    case ReadOnlyCapabilityApply(arg) =>
-      arg.toCapabilities.map(_.readOnly)
-    case CapsOfApply(arg) =>
-      arg.toCapabilities
-    case _ => tree.tpe.dealiasKeepAnnots match
-      case ref: TermRef if ref.isCapRef =>
-        GlobalCap :: Nil
-      case ref: Capability if ref.isTrackableRef =>
-        ref :: Nil
-      case AnnotatedType(parent, ann)
-      if ann.symbol.isRetains && parent.derivesFrom(defn.Caps_CapSet) =>
-        ann.tree.toCaptureSet.elems.toList
-      case tpe =>
-        throw IllegalCaptureRef(tpe) // if this was compiled from cc syntax, problem should have been reported at Typer
-
   /** Convert a @retains or @retainsByName annotation tree to the capture set it represents.
    *  For efficience, the result is cached as an Attachment on the tree.
    */
@@ -76,28 +61,52 @@ extension (tree: Tree)
     tree.getAttachment(Captures) match
       case Some(refs) => refs
       case None =>
-        val refs = CaptureSet(tree.retainedElems.flatMap(_.toCapabilities)*)
-          //.showing(i"toCaptureSet $tree --> $result", capt)
+        val refs = CaptureSet(tree.retainedSet.retainedElements*)
         tree.putAttachment(Captures, refs)
         refs
 
-  /** The arguments of a @retains, @retainsCap or @retainsByName annotation */
-  def retainedElems(using Context): List[Tree] = tree match
-    case Apply(_, Typed(SeqLiteral(elems, _), _) :: Nil) =>
-      elems
-    case _ =>
-      if tree.symbol.maybeOwner == defn.RetainsCapAnnot
-      then ref(defn.captureRoot) :: Nil
-      else Nil
+  /** The type representing the capture set of @retains, @retainsCap or @retainsByName annotation. */
+  def retainedSet(using Context): Type =
+    tree match
+      case Apply(TypeApply(_, refs :: Nil), _) => refs.tpe
+      case _ =>
+        if tree.symbol.maybeOwner == defn.RetainsCapAnnot
+        then defn.captureRoot.termRef else NoType
 
 extension (tp: Type)
+
+  def toCapability(using Context): Capability = tp match
+    case ReachCapability(tp1) =>
+      tp1.toCapability.reach
+    case ReadOnlyCapability(tp1) =>
+      tp1.toCapability.readOnly
+    case ref: TermRef if ref.isCapRef =>
+      GlobalCap
+    case ref: Capability if ref.isTrackableRef =>
+      ref
+    case _ =>
+      // if this was compiled from cc syntax, problem should have been reported at Typer
+      throw IllegalCaptureRef(tp)
+
+  /** A list of raw elements of a retained set.
+   *  This will not crash even if it contains a non-wellformed Capability.
+   */
+  def retainedElementsRaw(using Context): List[Type] = tp match
+    case OrType(tp1, tp2) =>
+      tp1.retainedElementsRaw ++ tp2.retainedElementsRaw
+    case tp =>
+      // Nothing is a special type to represent the empty set
+      if tp.isNothingType then Nil
+      else tp :: Nil // should be checked by wellformedness
+
+  /** A list of capabilities of a retained set. */
+  def retainedElements(using Context): List[Capability] =
+    retainedElementsRaw.map(_.toCapability)
 
   /** Is this type a Capability that can be tracked?
    *  This is true for
    *    - all ThisTypes and all TermParamRef,
    *    - stable TermRefs with NoPrefix or ThisTypes as prefixes,
-   *    - the root capability `caps.cap`
-   *    - abstract or parameter TypeRefs that derive from caps.CapSet
    *    - annotated types that represent reach or maybe capabilities
    */
   final def isTrackableRef(using Context): Boolean = tp match
@@ -395,6 +404,9 @@ extension (tp: Type)
     RefinedType(tp, name,
       AnnotatedType(rinfo, Annotation(defn.RefineOverrideAnnot, util.Spans.NoSpan)))
 
+  def dropUseAndConsumeAnnots(using Context): Type =
+    tp.dropAnnot(defn.UseAnnot).dropAnnot(defn.ConsumeAnnot)
+
 extension (tp: MethodType)
   /** A method marks an existential scope unless it is the prefix of a curried method */
   def marksExistentialScope(using Context): Boolean =
@@ -408,7 +420,7 @@ extension (cls: ClassSymbol)
       || bc.is(CaptureChecked)
           && bc.givenSelfType.dealiasKeepAnnots.match
             case CapturingType(_, refs) => refs.isAlwaysEmpty
-            case RetainingType(_, refs) => refs.isEmpty
+            case RetainingType(_, refs) => refs.retainedElements.isEmpty
             case selfType =>
               isCaptureChecking  // At Setup we have not processed self types yet, so
                                  // unless a self type is explicitly given, we can't tell
@@ -490,17 +502,23 @@ extension (sym: Symbol)
   def hasTrackedParts(using Context): Boolean =
     !CaptureSet.ofTypeDeeply(sym.info).isAlwaysEmpty
 
-  /** `sym` is annotated @use or it is a type parameter with a matching
+  /** `sym` itself or its info is annotated @use or it is a type parameter with a matching
    *  @use-annotated term parameter that contains `sym` in its deep capture set.
    */
   def isUseParam(using Context): Boolean =
     sym.hasAnnotation(defn.UseAnnot)
+    || sym.info.hasAnnotation(defn.UseAnnot)
     || sym.is(TypeParam)
         && sym.owner.rawParamss.nestedExists: param =>
             param.is(TermParam) && param.hasAnnotation(defn.UseAnnot)
             && param.info.deepCaptureSet.elems.exists:
                 case c: TypeRef => c.symbol == sym
                 case _ => false
+
+  /** `sym` or its info is annotated with `@consume`. */
+  def isConsumeParam(using Context): Boolean =
+    sym.hasAnnotation(defn.ConsumeAnnot)
+    || sym.info.hasAnnotation(defn.ConsumeAnnot)
 
   def isUpdateMethod(using Context): Boolean =
     sym.isAllOf(Mutable | Method, butNot = Accessor)
@@ -523,32 +541,36 @@ class CleanupRetains(using Context) extends TypeMap:
   def apply(tp: Type): Type =
     tp match
       case AnnotatedType(tp, annot) if annot.symbol == defn.RetainsAnnot || annot.symbol == defn.RetainsByNameAnnot =>
-        RetainingType(tp, Nil, byName = annot.symbol == defn.RetainsByNameAnnot)
+        RetainingType(tp, defn.NothingType, byName = annot.symbol == defn.RetainsByNameAnnot)
       case _ => mapOver(tp)
 
-/** An extractor for `caps.reachCapability(ref)`, which is used to express a reach
- *  capability as a tree in a @retains annotation.
+/** A base class for extractors that match annotated types with a specific
+ *  Capability annotation.
  */
-object ReachCapabilityApply:
-  def unapply(tree: Apply)(using Context): Option[Tree] = tree match
-    case Apply(reach, arg :: Nil) if reach.symbol == defn.Caps_reachCapability => Some(arg)
+abstract class AnnotatedCapability(annotCls: Context ?=> ClassSymbol):
+  def apply(tp: Type)(using Context): AnnotatedType =
+    AnnotatedType(tp, Annotation(annotCls, util.Spans.NoSpan))
+
+  def unapply(tree: AnnotatedType)(using Context): Option[Type] = tree match
+    case AnnotatedType(parent: Type, ann) if ann.hasSymbol(annotCls) => Some(parent)
     case _ => None
 
-/** An extractor for `caps.readOnlyCapability(ref)`, which is used to express a read-only
- *  capability as a tree in a @retains annotation.
- */
-object ReadOnlyCapabilityApply:
-  def unapply(tree: Apply)(using Context): Option[Tree] = tree match
-    case Apply(ro, arg :: Nil) if ro.symbol == defn.Caps_readOnlyCapability => Some(arg)
-    case _ => None
+end AnnotatedCapability
 
-/** An extractor for `caps.capsOf[X]`, which is used to express a generic capture set
- *  as a tree in a @retains annotation.
+/** An extractor for `ref @readOnlyCapability`, which is used to express
+ *  the read-only capability `ref.rd` as a type.
  */
-object CapsOfApply:
-  def unapply(tree: TypeApply)(using Context): Option[Tree] = tree match
-    case TypeApply(capsOf, arg :: Nil) if capsOf.symbol == defn.Caps_capsOf => Some(arg)
-    case _ => None
+object ReadOnlyCapability extends AnnotatedCapability(defn.ReadOnlyCapabilityAnnot)
+
+/** An extractor for `ref @reachCapability`, which is used to express
+ *  the reach capability `ref*` as a type.
+ */
+object ReachCapability extends AnnotatedCapability(defn.ReachCapabilityAnnot)
+
+/** An extractor for `ref @amaybeCapability`, which is used to express
+ *  the maybe capability `ref?` as a type.
+ */
+object MaybeCapability extends AnnotatedCapability(defn.MaybeCapabilityAnnot)
 
 /** An extractor for all kinds of function types as well as method and poly types.
  *  It includes aliases of function types such as `=>`. TODO: Can we do without?

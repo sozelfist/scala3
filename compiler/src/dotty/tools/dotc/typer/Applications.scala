@@ -726,11 +726,14 @@ trait Applications extends Compatibility {
           def addTyped(arg: Arg): List[Type] =
             if !formal.isRepeatedParam then checkNoVarArg(arg)
             addArg(typedArg(arg, formal), formal)
-            if methodType.isParamDependent && typeOfArg(arg).exists then
-              // `typeOfArg(arg)` could be missing because the evaluation of `arg` produced type errors
-              formals1.mapconserve(safeSubstParam(_, methodType.paramRefs(n), typeOfArg(arg)))
-            else
-              formals1
+            if methodType.looksParamDependent
+                  // need to handle also false dependencies since we generate TypeTrees from
+                  // formal parameters in makeVarArg. These are not de-aliased, so they might contain
+                  // stray parameter references. Test case is i23266.scala.
+                && typeOfArg(arg).exists
+                  // `typeOfArg(arg)` could be missing because the evaluation of `arg` produced type errors
+            then formals1.mapconserve(safeSubstParam(_, methodType.paramRefs(n), typeOfArg(arg)))
+            else formals1
 
           def missingArg(n: Int): Unit =
             fail(MissingArgument(methodType.paramNames(n), methString))
@@ -1117,9 +1120,7 @@ trait Applications extends Compatibility {
             val fun2 = Applications.retypeSignaturePolymorphicFn(fun1, methType)
             simpleApply(fun2, proto)
           case funRef: TermRef =>
-            // println(i"typedApply: $funRef, ${tree.args}, ${funRef.symbol.maybeOwner.isRetains}")
-            val applyCtx = if funRef.symbol.maybeOwner.isRetains then ctx.addMode(Mode.InCaptureSet) else ctx
-            val app = ApplyTo(tree, fun1, funRef, proto, pt)(using applyCtx)
+            val app = ApplyTo(tree, fun1, funRef, proto, pt)
             convertNewGenericArray(
               widenEnumCase(
                 postProcessByNameArgs(funRef, app).computeNullable(),
@@ -2112,8 +2113,8 @@ trait Applications extends Compatibility {
             else 0
     end compareWithTypes
 
-    if alt1.symbol.is(ConstructorProxy) && !alt2.symbol.is(ConstructorProxy) then -1
-    else if alt2.symbol.is(ConstructorProxy) && !alt1.symbol.is(ConstructorProxy) then 1
+    if alt1.symbol.is(PhantomSymbol) && !alt2.symbol.is(PhantomSymbol) then -1
+    else if alt2.symbol.is(PhantomSymbol) && !alt1.symbol.is(PhantomSymbol) then 1
     else
       val fullType1 = widenGiven(alt1.widen, alt1)
       val fullType2 = widenGiven(alt2.widen, alt2)
@@ -2169,27 +2170,16 @@ trait Applications extends Compatibility {
   def resolveOverloaded(alts: List[TermRef], pt: Type)(using Context): List[TermRef] =
     record("resolveOverloaded")
 
-    /** Is `alt` a method or polytype whose approximated result type after the first value parameter
+    /** Is `alt` a method or polytype whose result type after the first value parameter
      *  section conforms to the expected type `resultType`? If `resultType`
      *  is a `IgnoredProto`, pick the underlying type instead.
-     *
-     *  Using an approximated result type is necessary to avoid false negatives
-     *  due to incomplete type inference such as in tests/pos/i21410.scala and tests/pos/i21410b.scala.
      */
     def resultConforms(altSym: Symbol, altType: Type, resultType: Type)(using Context): Boolean =
       resultType.revealIgnored match {
         case resultType: ValueType =>
           altType.widen match {
             case tp: PolyType => resultConforms(altSym, instantiateWithTypeVars(tp), resultType)
-            case tp: MethodType =>
-              val wildRes = wildApprox(tp.resultType)
-
-              class ResultApprox extends AvoidWildcardsMap:
-                // Avoid false negatives by approximating to a lower bound
-                variance = -1
-
-              val approx = ResultApprox()(wildRes)
-              constrainResult(altSym, approx, resultType)
+            case tp: MethodType => constrainResult(altSym, tp.resultType, resultType)
             case _ => true
           }
         case _ => true
@@ -2561,7 +2551,6 @@ trait Applications extends Compatibility {
       if t.exists && alt.symbol.exists then
         val (trimmed, skipped) = trimParamss(t.stripPoly, alt.symbol.rawParamss)
         val mappedSym = alt.symbol.asTerm.copy(info = t)
-        mappedSym.annotations = alt.symbol.annotations
         mappedSym.rawParamss = trimmed
         val (pre, totalSkipped) = mappedAltInfo(alt.symbol) match
           case Some((pre, prevSkipped)) =>

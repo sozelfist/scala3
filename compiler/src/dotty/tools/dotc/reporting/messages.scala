@@ -357,7 +357,7 @@ class TypeMismatch(val found: Type, expected: Type, val inTree: Option[untpd.Tre
     ++ addenda.dropWhile(_.isEmpty).headOption.getOrElse(importSuggestions)
 
   override def explain(using Context) =
-    val treeStr = inTree.map(x => s"\nTree: ${x.show}").getOrElse("")
+    val treeStr = inTree.map(x => s"\nTree:\n\n${x.show}\n").getOrElse("")
     treeStr + "\n" + super.explain
 
 end TypeMismatch
@@ -542,7 +542,6 @@ extends SyntaxMsg(RepeatedModifierID) {
   }
 
   override def actions(using Context) =
-    import scala.language.unsafeNulls
     List(
       CodeAction(title = s"""Remove repeated modifier: "$modifier"""",
         description = None,
@@ -887,7 +886,6 @@ extends Message(PatternMatchExhaustivityID) {
         |"""
 
   override def actions(using Context) =
-    import scala.language.unsafeNulls
     val endPos = tree.cases.lastOption.map(_.endPos)
       .getOrElse(tree.selector.endPos)
     val startColumn = tree.cases.lastOption
@@ -910,7 +908,6 @@ extends Message(PatternMatchExhaustivityID) {
 
 
   private def indent(text:String, margin: Int): String = {
-    import scala.language.unsafeNulls
     " " * margin + text
   }
 }
@@ -1991,7 +1988,6 @@ class OnlyFunctionsCanBeFollowedByUnderscore(tp: Type, tree: untpd.PostfixOp)(us
         |To convert to a function value, you need to explicitly write ${hl("() => x")}"""
 
   override def actions(using Context) =
-    import scala.language.unsafeNulls
     val untpd.PostfixOp(qual, Ident(nme.WILDCARD)) = tree: @unchecked
     List(
       CodeAction(title = "Rewrite to function value",
@@ -2021,7 +2017,6 @@ class MissingEmptyArgumentList(method: String, tree: tpd.Tree)(using Context)
   }
 
   override def actions(using Context) =
-    import scala.language.unsafeNulls
     List(
       CodeAction(title = "Insert ()",
         description = None,
@@ -3277,7 +3272,7 @@ extends SyntaxMsg(VolatileOnValID):
   protected def explain(using Context): String = ""
 
 class ConstructorProxyNotValue(sym: Symbol)(using Context)
-extends TypeMsg(ConstructorProxyNotValueID):
+extends TypeMsg(PhantomSymbolNotValueID):
   protected def msg(using Context): String =
     i"constructor proxy $sym cannot be used as a value"
   protected def explain(using Context): String =
@@ -3292,7 +3287,7 @@ extends TypeMsg(ConstructorProxyNotValueID):
        |but not as a stand-alone value."""
 
 class ContextBoundCompanionNotValue(sym: Symbol)(using Context)
-extends TypeMsg(ConstructorProxyNotValueID):
+extends TypeMsg(PhantomSymbolNotValueID):
   protected def msg(using Context): String =
     i"context bound companion $sym cannot be used as a value"
   protected def explain(using Context): String =
@@ -3310,6 +3305,22 @@ extends TypeMsg(ConstructorProxyNotValueID):
        |the selection `A.unit`, which works because the compiler created a context bound
        |companion value with the (term-)name `A`. However, these context bound companions
        |are not values themselves, they can only be referred to in selections."""
+
+class DummyCaptureParamNotValue(sym: Symbol)(using Context)
+extends TypeMsg(PhantomSymbolNotValueID):
+  protected def msg(using Context): String =
+    i"dummy term capture parameter $sym cannot be used as a value"
+  protected def explain(using Context): String =
+    i"""A term capture parameter is a symbol made up by the compiler to represent a reference
+       |to a real capture parameter in capture sets. For instance, in
+       |
+       |   class A:
+       |     type C^
+       |
+       |there is just a type `A` declared but not a value `A`. Nevertheless, one can write
+       |the selection `(a: A).C` and use a a value, which works because the compiler created a
+       |term capture parameter for `C`. However, these term capture parameters are not real values,
+       |they can only be referred in capture sets."""
 
 class UnusedSymbol(errorText: String, val actions: List[CodeAction] = Nil)(using Context)
 extends Message(UnusedSymbolID):
@@ -3518,7 +3529,7 @@ final class OnlyFullyDependentAppliedConstructorType()(using Context)
   override protected def explain(using Context): String = ""
 
 final class IllegalContextBounds(using Context) extends SyntaxMsg(IllegalContextBoundsID):
-  override protected def msg(using Context): String = 
+  override protected def msg(using Context): String =
     i"Context bounds are not allowed in this position"
 
   override protected def explain(using Context): String = ""

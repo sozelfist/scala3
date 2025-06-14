@@ -53,6 +53,7 @@ import transform.CheckUnused.OriginalName
 
 import scala.annotation.{unchecked as _, *}
 import dotty.tools.dotc.util.chaining.*
+import dotty.tools.dotc.ast.untpd.Mod
 
 object Typer {
 
@@ -210,7 +211,7 @@ class Typer(@constructorOnly nestingLevel: Int = 0) extends Namer
       altImports: mutable.ListBuffer[TermRef] | Null = null)(using Context): Type = {
     val refctx = ctx
     val noImports = ctx.mode.is(Mode.InPackageClauseName)
-    def suppressErrors = excluded.is(ConstructorProxy)
+    def suppressErrors = excluded.is(PhantomSymbol)
       // when searching for references shadowed by a constructor proxy, do not report errors
     def fail(msg: Message) =
       if !suppressErrors then report.error(msg, pos)
@@ -649,8 +650,10 @@ class Typer(@constructorOnly nestingLevel: Int = 0) extends Namer
      */
     def checkNotShadowed(ownType: Type): Type =
       ownType match
-        case ownType: TermRef if ownType.symbol.is(ConstructorProxy) =>
-          findRef(name, pt, EmptyFlags, ConstructorProxy, tree.srcPos) match
+        case ownType: TermRef
+          if ownType.symbol.is(PhantomSymbol)
+            && !(ctx.mode.is(Mode.InCaptureSet) && ownType.symbol.isDummyCaptureParam) =>
+          findRef(name, pt, EmptyFlags, PhantomSymbol, tree.srcPos) match
             case shadowed: TermRef if !shadowed.symbol.maybeOwner.isEmptyPackage =>
               pt match
                 case pt: FunOrPolyProto =>
@@ -715,10 +718,6 @@ class Typer(@constructorOnly nestingLevel: Int = 0) extends Namer
         && ctx.owner.owner.unforcedDecls.lookup(tree.name).exists
     then // we are in the arguments of a this(...) constructor call
       errorTree(tree, em"$tree is not accessible from constructor arguments")
-    else if name.isTermName && ctx.mode.is(Mode.InCaptureSet) then
-      // If we are in a capture set and the identifier is not a term name,
-      // try to type it with the same name but as a type
-      typed(untpd.makeCapsOf(untpd.cpy.Ident(tree)(name.toTypeName)), pt)
     else
       errorTree(tree, MissingIdent(tree, kind, name, pt))
   end typedIdent
@@ -924,13 +923,6 @@ class Typer(@constructorOnly nestingLevel: Int = 0) extends Namer
         typedCBSelect(tree0, pt, qual)
       else EmptyTree
 
-    // Otherwise, if we are in a capture set, try to type it as a capture variable
-    // reference (as selecting a type name).
-    def trySelectTypeInCaptureSet() =
-      if tree0.name.isTermName && ctx.mode.is(Mode.InCaptureSet) then
-        typedSelectWithAdapt(untpd.cpy.Select(tree0)(qual, tree0.name.toTypeName), pt, qual)
-      else EmptyTree
-
     // Otherwise, report an error
     def reportAnError() =
       assignType(tree,
@@ -952,7 +944,6 @@ class Typer(@constructorOnly nestingLevel: Int = 0) extends Namer
       .orElse(tryDynamic())
       .orElse(trySelectable())
       .orElse(tryCBCompanion())
-      .orElse(trySelectTypeInCaptureSet())
       .orElse(reportAnError())
   end typedSelectWithAdapt
 
@@ -1088,7 +1079,19 @@ class Typer(@constructorOnly nestingLevel: Int = 0) extends Namer
         errorTree(tree, em"cannot convert to type selection") // will never be printed due to fallback
     }
 
-    if (tree.qualifier.isType) {
+    def warnUnnecessaryNN(tree: Tree): Unit = {
+      if ctx.explicitNulls then {
+        val symbol = tree.symbol
+        if symbol.exists && symbol.owner == defn.ScalaPredefModuleClass && symbol.name == nme.nn then
+          tree match
+          case Apply(_, args) =>
+            if(args.head.tpe.isNotNull) then report.warning("Unnecessary .nn: qualifier is already not null", tree)
+            if pt.admitsNull then report.warning("Unnecessary .nn: expected type admits null", tree)
+          case _ =>
+      }
+    }
+
+    val tree1 = if (tree.qualifier.isType) {
       val qual1 = typedType(tree.qualifier, shallowSelectionProto(tree.name, pt, this, tree.nameSpan))
       assignType(cpy.Select(tree)(qual1, tree.name), qual1)
     }
@@ -1098,6 +1101,9 @@ class Typer(@constructorOnly nestingLevel: Int = 0) extends Namer
       tryAlternatively(typeSelectOnTerm)(tryJavaSelectOnType)
     else
       typeSelectOnTerm
+
+    warnUnnecessaryNN(tree1)
+    tree1
   }
 
   def typedThis(tree: untpd.This)(using Context): Tree = {
@@ -2541,8 +2547,12 @@ class Typer(@constructorOnly nestingLevel: Int = 0) extends Namer
       errorTree(tree,
         em"Illegal context bound: ${tycon.tpe} does not take type parameters$selfNote.")
 
-  def typedSingletonTypeTree(tree: untpd.SingletonTypeTree)(using Context): SingletonTypeTree = {
+  def typedSingletonTypeTree(tree: untpd.SingletonTypeTree)(using Context): Tree = {
     val ref1 = typedExpr(tree.ref, SingletonTypeProto)
+    if ctx.mode.is(Mode.InCaptureSet) && ref1.symbol.isDummyCaptureParam then
+      // When a dummy term capture variable is found, it is replaced with
+      // the corresponding type references (stored in the underling types).
+      return Ident(ref1.tpe.widen.asInstanceOf[TypeRef]).withSpan(tree.span)
     checkStable(ref1.tpe, tree.srcPos, "singleton type")
     assignType(cpy.SingletonTypeTree(tree)(ref1), ref1)
   }
@@ -2923,6 +2933,9 @@ class Typer(@constructorOnly nestingLevel: Int = 0) extends Namer
     val vdef1 = assignType(cpy.ValDef(vdef)(name, tpt1, rhs1), sym)
     postProcessInfo(vdef1, sym)
     vdef1.setDefTree
+
+    migrate(ImplicitToGiven.valDef(vdef1))
+
     val nnInfo = rhs1.notNullInfo
     vdef1.withNotNullInfo(if sym.is(Lazy) then nnInfo.retractedInfo else nnInfo)
   }
@@ -3034,6 +3047,8 @@ class Typer(@constructorOnly nestingLevel: Int = 0) extends Namer
         )
 
     val ddef2 = assignType(cpy.DefDef(ddef)(name, paramss1, tpt1, rhs1), sym)
+
+    migrate(ImplicitToGiven.defDef(ddef2))
 
     postProcessInfo(ddef2, sym)
     //todo: make sure dependent method types do not depend on implicits or by-name params
@@ -3431,7 +3446,10 @@ class Typer(@constructorOnly nestingLevel: Int = 0) extends Namer
   end typedPackageDef
 
   def typedAnnotated(tree: untpd.Annotated, pt: Type)(using Context): Tree = {
-    val annot0 = withMode(Mode.InAnnotation)(typedExpr(tree.annot))
+    var annotCtx = ctx.addMode(Mode.InAnnotation)
+    if tree.annot.hasAttachment(untpd.RetainsAnnot) then
+      annotCtx = annotCtx.addMode(Mode.InCaptureSet)
+    val annot0 = typedExpr(tree.annot)(using annotCtx)
     val annot1 = checkAnnotClass(annot0)
     val annotCls = Annotations.annotClass(annot1)
     if annotCls == defn.NowarnAnnot then
@@ -4266,6 +4284,7 @@ class Typer(@constructorOnly nestingLevel: Int = 0) extends Namer
       case wtp: MethodOrPoly =>
         def methodStr = methPart(tree).symbol.showLocated
         if matchingApply(wtp, pt) then
+          migrate(ImplicitToGiven.implicitParams(tree, wtp, pt))
           migrate(contextBoundParams(tree, wtp, pt))
           migrate(implicitParams(tree, wtp, pt))
           if needsTupledDual(wtp, pt) then adapt(tree, pt.tupledDual, locked)
@@ -4543,15 +4562,10 @@ class Typer(@constructorOnly nestingLevel: Int = 0) extends Namer
             true
           }
 
-      def isRetainsArg(pt: Type) = pt match
-        case AnnotatedType(arg, annot) => annot.symbol == defn.RetainsArgAnnot
-        case _ => false
-
       if (implicitFun || caseCompanion)
           && !isApplyProto(pt)
           && pt != SingletonTypeProto
           && pt != LhsProto
-          && !isRetainsArg(pt)
           && !ctx.mode.is(Mode.Pattern)
           && !tree.isInstanceOf[SplicePattern]
           && !ctx.isAfterTyper
